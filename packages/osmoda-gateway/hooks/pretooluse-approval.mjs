@@ -15,7 +15,9 @@
 // on a tiny local catastrophic backstop so box-ending commands are blocked even
 // when agentd is down. agentd's matcher remains the real, tested policy.
 
+import fs from "node:fs";
 import http from "node:http";
+import { fileURLToPath } from "node:url";
 
 const GATED_TOOLS = new Set(["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"]);
 const SOCKET = process.env.OSMODA_SOCKET || "/run/osmoda/agentd.sock";
@@ -65,6 +67,24 @@ export function isSelfProtected(path) {
 export function isCatastrophic(command) {
   if (!command) return false;
   return CATASTROPHIC.some((re) => re.test(command));
+}
+
+/**
+ * True when this file was launched as the process entrypoint (rather than
+ * imported by the unit tests). Both sides are resolved through realpath first:
+ * the hook is normally installed as a symlink into the agent's settings dir, so
+ * a naive `import.meta.url === file://${process.argv[1]}` comparison fails and
+ * the gate would silently no-op — i.e. every gated tool call would run ungated.
+ */
+export function invokedDirectly() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  if (!import.meta.url.startsWith("file:")) return false;
+  try {
+    return fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
 }
 
 function emitDeny(reason) {
@@ -182,6 +202,6 @@ async function main() {
 }
 
 // Run only when invoked directly (not when imported by the unit tests).
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (invokedDirectly()) {
   main();
 }

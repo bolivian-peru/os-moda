@@ -1,14 +1,27 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   gatedKind,
   isSelfProtected,
   isCatastrophic,
+  invokedDirectly,
 } from "../hooks/pretooluse-approval.mjs";
 
 // The PreToolUse hook routes the tier-0 agent's native Bash/Write/Edit through
 // agentd's ApprovalGate. These lock the pure decision logic (the agentd round-trip
 // itself is integration-tested on a live box — see docs/SECURITY.md).
+
+const HOOK_PATH = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "hooks",
+  "pretooluse-approval.mjs",
+);
 
 test("read-only / non-gated tools are skipped", () => {
   for (const t of ["Read", "Glob", "Grep", "WebFetch", "mcp__osmoda__system_health"]) {
@@ -77,5 +90,42 @@ test("ordinary commands are NOT catastrophic (fail-open when agentd is down)", (
     "",
   ]) {
     assert.equal(isCatastrophic(c), false, `should NOT be catastrophic: ${c}`);
+  }
+});
+
+test("importing the hook does not auto-run main()", () => {
+  // process.argv[1] is the test runner here, not the hook → the gate stays dormant.
+  assert.equal(invokedDirectly(), false);
+});
+
+test("a symlinked install still runs the gate", (t) => {
+  // Claude settings install the hook as a symlink, so argv[1] is the link while
+  // import.meta.url is the target. Without realpath resolution the hook would
+  // silently allow every gated tool call — the exact gap this covers.
+  const dir = mkdtempSync(join(tmpdir(), "osmoda-hook-"));
+  const link = join(dir, "pretooluse-approval.mjs");
+  try {
+    try {
+      symlinkSync(HOOK_PATH, link);
+    } catch {
+      t.skip("symlinks unavailable on this platform");
+      return;
+    }
+
+    const res = spawnSync(process.execPath, [link], {
+      input: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf /" } }),
+      encoding: "utf8",
+      // Point at a dead socket so agentd is unreachable → the local catastrophic
+      // backstop is what must answer, deterministically, on any machine.
+      env: { ...process.env, OSMODA_SOCKET: join(dir, "no-agentd.sock") },
+      timeout: 15000,
+    });
+
+    assert.equal(res.status, 0, `hook exited non-zero: ${res.stderr}`);
+    const out = JSON.parse(res.stdout || "{}");
+    assert.equal(out?.hookSpecificOutput?.permissionDecision, "deny");
+    assert.equal(out?.hookSpecificOutput?.hookEventName, "PreToolUse");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
